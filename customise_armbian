@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+
+IMAGE="${1}"
+action="set_board, shell, snapd"
+
+while getopts ":aH:i:s:o:uw:" o; do
+    case "${o}" in
+        a)
+            action="${action}, avahi"
+            ;;
+        i)
+            IMAGE=${OPTARG}
+            ;;
+        H)
+            action="${action}, set_hostname"
+            new_hostname="${OPTARG}"
+            ;;
+        s)
+            action="${action}, salt_minion"
+            salt_master="${OPTARG}"
+            ;;
+	o)
+            output_file="${OPTARG}"
+            ;;
+        u)
+            action="${action}, upgrade"
+            ;;
+        w)
+            write_to="${OPTARG}"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+function delete_lo_device () {
+  lo_device="${1}"
+  umount_target
+  losetup -v -d "${lo_device}"
+}
+
+function umount_target () {
+  #umount -l "/target/dev/pts" 2>/dev/null
+  if [ -f /target/usr/bin/qemu-arm-static ]; then
+    rm /target/usr/bin/qemu-arm-static
+  fi
+  #umount -l "/target/dev" 2>/dev/null
+  #umount -l "/target/sys" 2>/dev/null
+  #umount -l "/target/proc" 2>/dev/null
+  umount -l "/target" 2>/dev/null
+  sleep 1
+  while read mount_point; do
+    echo "umount -l ${mount_point}"
+    #umount -l "${mount_point}"
+    #sleep 1
+    #umount -l "${mount_point}"
+  done < <(mount |grep '/target' | awk 'BEGIN{FS=" on "}{print $2}' | awk 'BEGIN{FS=" type "}{print $1}')
+}
+
+if [[ "${IMAGE}" =~ \.xz$ ]]; then
+  if [ "${output_file}" != "" ]; then
+    echo "Extracting compressed image"
+    xz -d -c "${IMAGE}" >"${output_file}"
+    IMAGE="${output_file}"
+  else
+    echo "Extracting compressed image to temporary location"
+    extracted_image=$(mktemp /var/tmp/customise_armbian.XXXXXX)
+    xz -d -c "${IMAGE}" >"${extracted_image}"
+    IMAGE="${extracted_image}"
+  fi
+fi
+
+lo_device=$(losetup -j "${IMAGE}" | awk 'BEGIN{FS=": "}{print $1}' | tail -n 1)
+while [ ! "${lo_device}" == "" ]; do
+  echo "Deleting existing loopback device '${lo_device}'"
+  delete_lo_device "${lo_device}"
+  lo_device=$(losetup -j "${IMAGE}" | awk 'BEGIN{FS=": "}{print $1}' | tail -n 1)
+done
+
+echo "Creating loopback device"
+losetup -f --partscan "${IMAGE}"
+lo_device=$(losetup -j "${IMAGE}" | awk 'BEGIN{FS=": "}{print $1}')
+echo "Created device '${lo_device}'"
+
+mkdir -p /target
+echo "Mounting file system in first partition"
+mount "${lo_device}"p1 /target
+mount --rbind /dev /target/dev
+mount --rbind /dev/pts /target/dev/pts
+mount --rbind /sys /target/sys
+mount --rbind /proc /target/proc
+
+cp -a /usr/bin/qemu-arm-static /target/usr/bin
+
+if [ -f /target/etc/os-release ]; then
+  source /target/etc/os-release
+fi
+
+if [[ "${action}" =~ set_board ]]; then
+  echo "Setting board specific settings (DTB, console, verbosity)"
+  echo -e "board_name=hc1\nusbstoragequirks=0x2537:0x1066:u,0x2537:0x1068:u\n" >/target/boot/armbianEnv.txt
+  sed -i 's/^setenv console.*$/setenv console "serial"/g' /target/boot/boot.ini
+  sed -i 's/^setenv verbosity.*$/setenv verbosity "5"/g' /target/boot/boot.ini
+fi
+
+if [[ "${action}" =~ set_hostname ]]; then
+  echo "Setting hostname"
+  # The following doesn't work because dbus isn't running inside the chroot
+  #chroot /target /usr/bin/hostnamectl set-hostname "${new_hostname}"
+  echo "${new_hostname}" >/target/etc/hostname
+
+  #TODO: We also need to remove the existing names for the salt minion to get
+  #  the right minion_id
+  echo -e "127.0.1.1\t${new_hostname}" >>/target/etc/hosts
+fi
+
+# Add any extra repositories here so we only need to run "apt update" once
+if [[ "${action}" =~ salt_minion ]]; then
+  echo "Adding SaltStack package repository"
+  # Using the amd64 repository on armhf/aarch64 seems to work fine.  There are no actual Arm repos.
+  echo "deb [arch=amd64] http://repo.saltstack.com/py3/ubuntu/${VERSION_ID}/amd64/latest ${VERSION_CODENAME}  main" >/target/etc/apt/sources.list.d/saltstack.list
+  wget -O - "https://repo.saltstack.com/py3/ubuntu/${VERSION_ID}/amd64/latest/SALTSTACK-GPG-KEY.pub" | chroot /target apt-key add -
+fi
+
+if [[ "${action}" =~ avahi ]] || [[ "${action}" =~ salt_minion ]] || [[ "${action}" =~ upgrade ]] ; then
+  chroot /target /usr/bin/apt update
+fi
+
+if [[ "${action}" =~ snapd ]]; then
+  chroot /target /usr/bin/apt install -y snapd
+fi
+
+if [[ "${action}" =~ avahi ]]; then
+  chroot /target /usr/bin/apt install -y avahi-daemon libnss-mdns
+  # The following stops nss_mdns defaulting to IPv4 names
+  sed -i /target/etc/nsswitch.conf -e 's/mdns4_minimal/mdns_minimal/g' -e 's/\[NOTFOUND=return\]//g'
+fi
+
+if [[ "${action}" =~ salt_minion ]]; then
+  echo "Installing SaltStack Minion"
+  chroot /target /usr/bin/apt install -y salt-minion
+  printf "master: ${salt_master}\nappend_domain: local\nminion_id_lowercase: True\nminion_id_caching: False" >/target/etc/salt/minion.d/local.conf
+  rm /target/etc/salt/minion_id
+  rm -fr /target/etc/salt/pki/
+fi
+
+if [[ "${action}" =~ upgrade ]]; then
+  echo "Installing all available updates"
+  chroot /target /usr/bin/apt full-upgrade -y
+fi
+
+if [[ "${action}" =~ shell ]]; then
+  echo "Chroot into target"
+  chroot /target /usr/bin/bash -i
+fi
+
+echo "Unmounting target"
+delete_lo_device "${lo_device}"
