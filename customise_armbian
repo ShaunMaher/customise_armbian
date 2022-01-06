@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 
+# exit when any command fails
+set -e
+
+# keep track of the last executed command
+trap 'last_command=$current_command; current_command=$BASH_COMMAND' DEBUG
+# echo an error message before exiting
+trap 'echo "\"${last_command}\" command filed with exit code $?."' EXIT
+
 IMAGE="${1}"
-action="set_board, shell, snapd"
+SWAP_PARTITION_LABEL="SWAP"
+VAR_FS_LABEL="VAR"
+RESIZE_FS_TO="2G"
+
+# removed "snapd"
+action="set_board, shell, swap_by_label, var_by_label, resize_fs, install_apparmor"
 
 while getopts ":aH:i:s:o:uw:" o; do
     case "${o}" in
@@ -48,14 +61,16 @@ function umount_target () {
   #umount -l "/target/dev" 2>/dev/null
   #umount -l "/target/sys" 2>/dev/null
   #umount -l "/target/proc" 2>/dev/null
-  umount -l "/target" 2>/dev/null
-  sleep 1
-  while read mount_point; do
-    echo "umount -l ${mount_point}"
+  if [ $(mount |awk 'BEGIN{FS=" on "}{print $2}' | awk 'BEGIN{FS=" type "}{print $1}' | grep -c '/target') -gt 0 ]; then
+    umount -R "/target"
+  fi
+  #sleep 1
+  #while read mount_point; do
+  #  echo "umount -l ${mount_point}"
     #umount -l "${mount_point}"
     #sleep 1
     #umount -l "${mount_point}"
-  done < <(mount |grep '/target' | awk 'BEGIN{FS=" on "}{print $2}' | awk 'BEGIN{FS=" type "}{print $1}')
+  #done < <(mount |grep '/target' | awk 'BEGIN{FS=" on "}{print $2}' | awk 'BEGIN{FS=" type "}{print $1}')
 }
 
 if [[ "${IMAGE}" =~ \.xz$ ]]; then
@@ -69,27 +84,44 @@ if [[ "${IMAGE}" =~ \.xz$ ]]; then
     xz -d -c "${IMAGE}" >"${extracted_image}"
     IMAGE="${extracted_image}"
   fi
+else
+  echo "Copying source image"
+  if [ "${output_file}" != "" ]; then
+    cp "${IMAGE}" "${output_file}"
+    IMAGE="${output_file}"
+  fi
+fi
+
+if [[ "${action}" =~ resize_fs ]]; then
+  echo "Expanding image and partition to ${RESIZE_FS_TO:-2G}"
+  qemu-img resize -f raw "${IMAGE}" "${RESIZE_FS_TO:-2G}"
+  parted "${IMAGE}" resizepart 1 100%
 fi
 
 lo_device=$(losetup -j "${IMAGE}" | awk 'BEGIN{FS=": "}{print $1}' | tail -n 1)
-while [ ! "${lo_device}" == "" ]; do
+while read lo_device; do
   echo "Deleting existing loopback device '${lo_device}'"
   delete_lo_device "${lo_device}"
   lo_device=$(losetup -j "${IMAGE}" | awk 'BEGIN{FS=": "}{print $1}' | tail -n 1)
-done
+done < <(losetup -j "${IMAGE}" | awk 'BEGIN{FS=": "}{print $1}' | tail -n 1)
 
 echo "Creating loopback device"
-losetup -f --partscan "${IMAGE}"
-lo_device=$(losetup -j "${IMAGE}" | awk 'BEGIN{FS=": "}{print $1}')
+lo_device=$(losetup -f --partscan --show "${IMAGE}")
 echo "Created device '${lo_device}'"
+
+if [[ "${action}" =~ resize_fs ]]; then
+  echo "Expanding filesystem"
+  e2fsck -f "${lo_device}"p1
+  resize2fs "${lo_device}"p1
+fi
 
 mkdir -p /target
 echo "Mounting file system in first partition"
 mount "${lo_device}"p1 /target
-mount --rbind /dev /target/dev
-mount --rbind /dev/pts /target/dev/pts
-mount --rbind /sys /target/sys
-mount --rbind /proc /target/proc
+mount --rbind --make-rslave /dev /target/dev
+mount --rbind --make-rslave /dev/pts /target/dev/pts
+mount --rbind --make-rslave /sys /target/sys
+mount --rbind --make-rslave /proc /target/proc
 
 cp -a /usr/bin/qemu-arm-static /target/usr/bin
 
@@ -112,7 +144,10 @@ if [[ "${action}" =~ set_hostname ]]; then
 
   #TODO: We also need to remove the existing names for the salt minion to get
   #  the right minion_id
-  echo -e "127.0.1.1\t${new_hostname}" >>/target/etc/hosts
+  grep -v -e '127.0.1.1' -e '::1' /target/etc/hosts >/target/tmp/hosts.tmp
+  echo -e "127.0.1.1\t${new_hostname} localhost" >>/target/tmp/hosts.tmp
+  echo -e "::1\t${new_hostname} localhost ip6-localhost ip6-loopback" >>/target/tmp/hosts.tmp
+  mv /target/tmp/hosts.tmp /target/etc/hosts
 fi
 
 # Add any extra repositories here so we only need to run "apt update" once
@@ -123,12 +158,24 @@ if [[ "${action}" =~ salt_minion ]]; then
   wget -O - "https://repo.saltstack.com/py3/ubuntu/${VERSION_ID}/amd64/latest/SALTSTACK-GPG-KEY.pub" | chroot /target apt-key add -
 fi
 
+if [[ "${action}" =~ swap_by_label ]]; then
+  echo "/dev/disk/by-partlabel/${SWAP_PARTITION_LABEL} swap swap defaults,nofail 0 0" >>/target/etc/fstab
+fi
+
+if [[ "${action}" =~ var_by_label ]]; then
+  echo "/dev/disk/by-label/${VAR_FS_LABEL} /var ext4 defaults,nofail 0 0" >>/target/etc/fstab
+fi
+
 if [[ "${action}" =~ avahi ]] || [[ "${action}" =~ salt_minion ]] || [[ "${action}" =~ upgrade ]] ; then
   chroot /target /usr/bin/apt update
 fi
 
 if [[ "${action}" =~ snapd ]]; then
   chroot /target /usr/bin/apt install -y snapd
+fi
+
+if [[ "${action}" =~ install_apparmor ]]; then
+  chroot /target /usr/bin/apt install -y apparmor
 fi
 
 if [[ "${action}" =~ avahi ]]; then
@@ -141,13 +188,17 @@ if [[ "${action}" =~ salt_minion ]]; then
   echo "Installing SaltStack Minion"
   chroot /target /usr/bin/apt install -y salt-minion
   printf "master: ${salt_master}\nappend_domain: local\nminion_id_lowercase: True\nminion_id_caching: False" >/target/etc/salt/minion.d/local.conf
-  rm /target/etc/salt/minion_id
-  rm -fr /target/etc/salt/pki/
+  if [ -f /target/etc/salt/minion_id ]; then
+    rm /target/etc/salt/minion_id
+  fi
+  if [ -d /target/etc/salt/pki/ ]; then
+    rm -fr /target/etc/salt/pki/
+  fi
 fi
 
 if [[ "${action}" =~ upgrade ]]; then
   echo "Installing all available updates"
-  chroot /target /usr/bin/apt full-upgrade -y
+  #chroot /target /usr/bin/apt full-upgrade -y
 fi
 
 if [[ "${action}" =~ shell ]]; then
@@ -155,5 +206,13 @@ if [[ "${action}" =~ shell ]]; then
   chroot /target /usr/bin/bash -i
 fi
 
+if [[ "${action}" =~ var_by_label ]]; then
+  # TODO: Create a first run unit that extracts this .tar.gz into /var and then
+  #   deletes it.
+  tar -czf /target/var.tgz /target/var
+fi
+
 echo "Unmounting target"
 delete_lo_device "${lo_device}"
+
+trap - EXIT
